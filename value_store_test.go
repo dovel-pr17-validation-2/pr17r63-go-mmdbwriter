@@ -1,0 +1,924 @@
+package mmdbwriter
+
+import (
+	"bytes"
+	"fmt"
+	"hash/maphash"
+	"math"
+	"reflect"
+	"strconv"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/maxmind/mmdbwriter/v2/inserter"
+	"github.com/maxmind/mmdbwriter/v2/mmdbtype"
+)
+
+func TestValueStoreInternStringBytes(t *testing.T) {
+	for _, size := range []int{0, 1, 28, 29, 284, 285, 286, 65820, 65821, 65822, 16843036} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			input := bytes.Repeat([]byte("x"), size)
+			store := newValueStore()
+			ref, err := store.internStringBytes(input)
+			require.NoError(t, err)
+			expected := mmdbtype.String(string(input))
+			other, err := store.internScalar(expected)
+			require.NoError(t, err)
+			assert.Equal(t, other, ref, "byte and string inputs must share one canonical value")
+			clear(input)
+			assert.Equal(t, expected, store.materialize(ref), "the store must own the key bytes")
+			store.release(ref)
+			store.release(other)
+			assert.Zero(t, liveValueNodeCount(store))
+		})
+	}
+}
+
+func TestValueStoreInternStringBytesRejectsOversizedInput(t *testing.T) {
+	store := newValueStore()
+	ref, err := store.internStringBytes(make([]byte, 16843037))
+	require.ErrorContains(t, err, "cannot store 16843037 bytes; max size is 16843036")
+	assert.Equal(t, nilValueRef, ref)
+	assert.Zero(t, liveValueNodeCount(store))
+}
+
+func TestValueStoreInternStringBytesReusesStorage(t *testing.T) {
+	store := newValueStore()
+	key := []byte("registered_country")
+	ref, err := store.internStringBytes(key)
+	require.NoError(t, err)
+	allocations := testing.AllocsPerRun(100, func() {
+		other, internErr := store.internStringBytes(key)
+		require.NoError(t, internErr)
+		store.release(other)
+	})
+	assert.Zero(t, allocations, "repeated keys must not allocate")
+	store.release(ref)
+	assert.Zero(t, liveValueNodeCount(store))
+}
+
+func TestValueStoreInternScalarString(t *testing.T) {
+	store := newValueStore()
+	value := mmdbtype.String("registered_country")
+	ref, err := store.internScalar(value)
+	require.NoError(t, err)
+	allocations := testing.AllocsPerRun(100, func() {
+		other, internErr := store.internScalar(value)
+		require.NoError(t, internErr)
+		store.release(other)
+	})
+	assert.Zero(t, allocations, "repeated strings must not allocate")
+	store.release(ref)
+	assert.Zero(t, liveValueNodeCount(store))
+}
+
+func TestValueStoreInternFloat64(t *testing.T) {
+	for _, value := range []float64{0, math.Copysign(0, -1), 1.25, -1.25, math.SmallestNonzeroFloat64, math.MaxFloat64, math.Inf(1), math.Inf(-1), math.NaN()} {
+		t.Run(fmt.Sprint(value), func(t *testing.T) {
+			store := newValueStore()
+			ref, err := store.internScalar(mmdbtype.Float64(value))
+			require.NoError(t, err)
+			other, err := store.internUncached(mmdbtype.Float64(value))
+			require.NoError(t, err)
+			assert.Equal(
+				t,
+				other,
+				ref,
+				"concrete and interface inputs must share one canonical value",
+			)
+			store.release(other)
+			allocations := testing.AllocsPerRun(100, func() {
+				repeated, internErr := store.internScalar(mmdbtype.Float64(value))
+				require.NoError(t, internErr)
+				store.release(repeated)
+			})
+			assert.Zero(t, allocations, "repeated values must not allocate")
+			store.release(ref)
+			assert.Zero(t, liveValueNodeCount(store))
+		})
+	}
+}
+
+func TestValueStoreInternUint16(t *testing.T) {
+	for _, value := range []mmdbtype.Uint16{0, 1, 255, 256, math.MaxUint16} {
+		t.Run(fmt.Sprint(value), func(t *testing.T) {
+			store := newValueStore()
+			ref, err := store.internScalar(value)
+			require.NoError(t, err)
+			other, err := store.internUncached(value)
+			require.NoError(t, err)
+			assert.Equal(
+				t,
+				other,
+				ref,
+				"concrete and interface inputs must share one canonical value",
+			)
+			store.release(other)
+			allocations := testing.AllocsPerRun(100, func() {
+				repeated, internErr := store.internScalar(value)
+				require.NoError(t, internErr)
+				store.release(repeated)
+			})
+			assert.Zero(t, allocations, "repeated values must not allocate")
+			store.release(ref)
+			assert.Zero(t, liveValueNodeCount(store))
+		})
+	}
+}
+
+func TestValueStoreInternUint32(t *testing.T) {
+	for _, value := range []mmdbtype.Uint32{0, 1, 255, 256, math.MaxUint16, 1 << 16, (1 << 24) - 1, 1 << 24, math.MaxUint32} {
+		t.Run(fmt.Sprint(value), func(t *testing.T) {
+			store := newValueStore()
+			ref, err := store.internScalar(value)
+			require.NoError(t, err)
+			other, err := store.internUncached(value)
+			require.NoError(t, err)
+			assert.Equal(
+				t,
+				other,
+				ref,
+				"concrete and interface inputs must share one canonical value",
+			)
+			store.release(other)
+			allocations := testing.AllocsPerRun(100, func() {
+				repeated, internErr := store.internScalar(value)
+				require.NoError(t, internErr)
+				store.release(repeated)
+			})
+			assert.Zero(t, allocations, "repeated values must not allocate")
+			store.release(ref)
+			assert.Zero(t, liveValueNodeCount(store))
+		})
+	}
+}
+
+func TestValueStoreInternUint128(t *testing.T) {
+	for _, value := range []mmdbtype.Uint128{
+		{},
+		{Low: 1},
+		{Low: math.MaxUint64},
+		{High: 1},
+		{High: 1, Low: 42},
+		{High: math.MaxUint64, Low: math.MaxUint64},
+	} {
+		t.Run(fmt.Sprint(value), func(t *testing.T) {
+			store := newValueStore()
+			ref, err := store.internScalar(value)
+			require.NoError(t, err)
+			other, err := store.intern(value)
+			require.NoError(t, err)
+			assert.Equal(
+				t,
+				other,
+				ref,
+				"concrete and interface inputs must share one canonical value",
+			)
+			assert.Equal(t, value, store.materialize(ref))
+			store.release(other)
+			allocations := testing.AllocsPerRun(100, func() {
+				repeated, internErr := store.internScalar(value)
+				require.NoError(t, internErr)
+				store.release(repeated)
+			})
+			assert.Zero(t, allocations, "repeated values must not allocate")
+			store.release(ref)
+			assert.Zero(t, liveValueNodeCount(store))
+		})
+	}
+}
+
+func TestValueStoreCanonicalizesAndMaterializesValues(t *testing.T) {
+	uint128 := mmdbtype.Uint128{Low: 1 << 20}
+	value := mmdbtype.Map{
+		"bool":    mmdbtype.Bool(true),
+		"bytes":   mmdbtype.Bytes{1, 2, 3},
+		"float32": mmdbtype.Float32(1.25),
+		"float64": mmdbtype.Float64(2.5),
+		"int32":   mmdbtype.Int32(-1),
+		"slice": mmdbtype.Slice{
+			mmdbtype.String("value"),
+			mmdbtype.Uint16(16),
+			mmdbtype.Uint32(32),
+			mmdbtype.Uint64(64),
+			uint128,
+		},
+	}
+
+	store := newValueStore()
+	first, err := store.intern(value)
+	require.NoError(t, err)
+	second, err := store.intern(value.Copy())
+	require.NoError(t, err)
+
+	assert.Equal(t, first, second)
+	assert.True(t, value.Equal(store.materialize(first)))
+
+	store.release(first)
+	store.release(second)
+}
+
+func TestValueStoreMapOrderDoesNotAffectIdentity(t *testing.T) {
+	store := newValueStore()
+	first, err := store.intern(mmdbtype.Map{
+		"a": mmdbtype.String("first"),
+		"b": mmdbtype.String("second"),
+	})
+	require.NoError(t, err)
+	second, err := store.intern(mmdbtype.Map{
+		"b": mmdbtype.String("second"),
+		"a": mmdbtype.String("first"),
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, first, second)
+	store.release(first)
+	store.release(second)
+}
+
+func TestValueStoreNormalizesPointerBackedValues(t *testing.T) {
+	boolValue := mmdbtype.Bool(true)
+	bytesValue := mmdbtype.Bytes{1, 2}
+	float32Value := mmdbtype.Float32(1.5)
+	float64Value := mmdbtype.Float64(2.5)
+	int32Value := mmdbtype.Int32(-3)
+	mapValue := mmdbtype.Map{"key": mmdbtype.String("value")}
+	sliceValue := mmdbtype.Slice{mmdbtype.Uint16(1)}
+	stringValue := mmdbtype.String("value")
+	uint16Value := mmdbtype.Uint16(16)
+	uint32Value := mmdbtype.Uint32(32)
+	uint64Value := mmdbtype.Uint64(64)
+	uint128Value := mmdbtype.Uint128{High: 1, Low: 42}
+
+	tests := []struct {
+		name    string
+		value   mmdbtype.DataType
+		pointer mmdbtype.DataType
+	}{
+		{name: "Bool", value: boolValue, pointer: &boolValue},
+		{name: "Bytes", value: bytesValue, pointer: &bytesValue},
+		{name: "Float32", value: float32Value, pointer: &float32Value},
+		{name: "Float64", value: float64Value, pointer: &float64Value},
+		{name: "Int32", value: int32Value, pointer: &int32Value},
+		{name: "Map", value: mapValue, pointer: &mapValue},
+		{name: "Slice", value: sliceValue, pointer: &sliceValue},
+		{name: "String", value: stringValue, pointer: &stringValue},
+		{name: "Uint16", value: uint16Value, pointer: &uint16Value},
+		{name: "Uint32", value: uint32Value, pointer: &uint32Value},
+		{name: "Uint64", value: uint64Value, pointer: &uint64Value},
+		{name: "Uint128", value: uint128Value, pointer: &uint128Value},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := newValueStore()
+			direct, err := store.intern(test.value)
+			require.NoError(t, err)
+			viaPointer, err := store.intern(test.pointer)
+			require.NoError(t, err)
+
+			assert.Equal(t, direct, viaPointer)
+			assert.True(t, test.value.Equal(store.materialize(direct)))
+			store.release(direct)
+			store.release(viaPointer)
+		})
+	}
+}
+
+func TestValueStoreUint128(t *testing.T) {
+	store := newValueStore()
+	maxValue := mmdbtype.Uint128{High: math.MaxUint64, Low: math.MaxUint64}
+	ref, err := store.intern(maxValue)
+	require.NoError(t, err)
+	pointerRef, err := store.intern(&maxValue)
+	require.NoError(t, err)
+	assert.Equal(t, ref, pointerRef)
+	assert.Equal(t, maxValue, store.materialize(ref))
+	store.release(ref)
+	store.release(pointerRef)
+	assert.Zero(t, liveValueNodeCount(store))
+}
+
+func TestValueStoreRejectsInvalidSliceChildren(t *testing.T) {
+	store := newValueStore()
+
+	_, err := store.intern(mmdbtype.Slice{mmdbtype.String("ok"), nil})
+	require.EqualError(t, err, "slice index 1 has a nil value")
+
+	var nilMap *mmdbtype.Map
+	_, err = store.intern(mmdbtype.Slice{mmdbtype.String("ok"), nilMap})
+	require.ErrorContains(t, err, "cannot intern a nil *mmdbtype.Map")
+
+	// Both rejections must release the children already interned.
+	assert.Zero(t, liveValueNodeCount(store))
+}
+
+func TestValueStoreRejectsNilPointerBackedValue(t *testing.T) {
+	store := newValueStore()
+	var nilMap *mmdbtype.Map
+	_, err := store.intern(nilMap)
+	require.EqualError(t, err, "cannot intern a nil *mmdbtype.Map")
+
+	var nilUint128 *mmdbtype.Uint128
+	_, err = store.intern(nilUint128)
+	require.EqualError(t, err, "cannot intern a nil *mmdbtype.Uint128")
+}
+
+func TestValueStoreRejectsPointerValue(t *testing.T) {
+	store := newValueStore()
+	_, err := store.intern(mmdbtype.Pointer(1))
+	require.EqualError(t, err, "unsupported MMDB data type mmdbtype.Pointer")
+}
+
+func TestValueStoreHashCollisionsUseExactEquality(t *testing.T) {
+	store := newValueStoreWithHash(func([]byte) uint64 { return 7 })
+	first, err := store.intern(mmdbtype.String("first"))
+	require.NoError(t, err)
+	second, err := store.intern(mmdbtype.String("second"))
+	require.NoError(t, err)
+	equalFirst, err := store.intern(mmdbtype.String("first"))
+	require.NoError(t, err)
+
+	assert.NotEqual(t, first, second)
+	assert.Equal(t, first, equalFirst)
+	assert.Equal(t, mmdbtype.String("first"), store.materialize(first))
+	assert.Equal(t, mmdbtype.String("second"), store.materialize(second))
+
+	store.release(first)
+	store.release(second)
+	store.release(equalFirst)
+}
+
+func TestValueStoreContainerHashCollisionsUseExactEquality(t *testing.T) {
+	store := newValueStoreWithHash(func([]byte) uint64 { return 7 })
+	firstValue := mmdbtype.Map{
+		"nested": mmdbtype.Slice{mmdbtype.String("first")},
+	}
+	secondValue := mmdbtype.Map{
+		"nested": mmdbtype.Slice{mmdbtype.String("second")},
+	}
+	first, err := store.intern(firstValue)
+	require.NoError(t, err)
+	second, err := store.intern(secondValue)
+	require.NoError(t, err)
+	equalFirst, err := store.intern(firstValue.Copy())
+	require.NoError(t, err)
+
+	assert.NotEqual(t, first, second)
+	assert.Equal(t, first, equalFirst)
+	assert.Equal(t, firstValue, store.materialize(first))
+	assert.Equal(t, secondValue, store.materialize(second))
+
+	store.release(first)
+	store.release(second)
+	store.release(equalFirst)
+}
+
+func TestValueStoreCascadeReleaseAndFreelistReuse(t *testing.T) {
+	store := newValueStore()
+	first, err := store.internUncached(mmdbtype.String("key"))
+	require.NoError(t, err)
+	second, err := store.internUncached(mmdbtype.Uint32(42))
+	require.NoError(t, err)
+	ref, err := store.internOwnedChildren(valueKindSlice, []valueRef{first, second})
+	require.NoError(t, err)
+	nodeCount := len(store.nodes)
+	store.release(ref)
+
+	assert.Zero(t, liveValueNodeCount(store))
+	assert.NotEmpty(t, store.freeRefs, "the cascade queued nothing for reuse")
+
+	reused, err := store.internUncached(mmdbtype.String("replacement"))
+	require.NoError(t, err)
+	assert.Less(t, int(reused), nodeCount, "the freed slots were not reused")
+	store.release(reused)
+}
+
+func TestValueStoreSharesMaterializedSubvalues(t *testing.T) {
+	shared := mmdbtype.Map{"en": mmdbtype.String("London")}
+	store := newValueStore()
+	first, err := store.intern(mmdbtype.Map{"names": shared, "id": mmdbtype.Uint32(1)})
+	require.NoError(t, err)
+	second, err := store.intern(mmdbtype.Map{"names": shared.Copy(), "id": mmdbtype.Uint32(2)})
+	require.NoError(t, err)
+
+	firstNames := store.materialize(first).(mmdbtype.Map)["names"].(mmdbtype.Map)
+	secondNames := store.materialize(second).(mmdbtype.Map)["names"].(mmdbtype.Map)
+	assert.Equal(t, reflect.ValueOf(firstNames).Pointer(), reflect.ValueOf(secondNames).Pointer())
+
+	store.release(first)
+	store.release(second)
+}
+
+func TestValueStoreMaterializedBytesDoNotAliasReusedArena(t *testing.T) {
+	store := newValueStore()
+	ref, err := store.internUncached(mmdbtype.Bytes{1, 2, 3})
+	require.NoError(t, err)
+	materialized := store.materialize(ref).(mmdbtype.Bytes)
+	store.release(ref)
+
+	replacement, err := store.internUncached(mmdbtype.Bytes{9, 9, 9})
+	require.NoError(t, err)
+	assert.Equal(t, mmdbtype.Bytes{1, 2, 3}, materialized)
+	store.release(replacement)
+}
+
+// TestReleaseUnregistersMaterializedIdentity pins that releasing a node
+// removes its materialized identity before the reference can be reused. A
+// stale entry would silently substitute unrelated data.
+func TestReleaseUnregistersMaterializedIdentity(t *testing.T) {
+	store := newValueStore()
+	ref, err := store.intern(mmdbtype.Map{"en": mmdbtype.String("one")})
+	require.NoError(t, err)
+	view := store.materialize(ref)
+	identity, ok := dataIdentity(view)
+	require.True(t, ok)
+	require.Contains(t, store.materializedByIdentity, identity)
+
+	store.release(ref)
+	assert.NotContains(t, store.materializedByIdentity, identity,
+		"a released node left its materialized identity registered")
+
+	// Reusing the freed ref must not resurrect the old identity mapping.
+	replacement, err := store.intern(mmdbtype.Map{"en": mmdbtype.String("two")})
+	require.NoError(t, err)
+	assert.NotContains(t, store.materializedByIdentity, identity)
+	store.release(replacement)
+}
+
+// TestReleaseUnlinksMidChainNode covers unlinking a node that is neither the
+// head nor the tail of a forced hash-collision chain.
+func TestReleaseUnlinksMidChainNode(t *testing.T) {
+	store := newValueStoreWithHash(func([]byte) uint64 { return 7 })
+	first, err := store.intern(mmdbtype.String("first"))
+	require.NoError(t, err)
+	second, err := store.intern(mmdbtype.String("second"))
+	require.NoError(t, err)
+	third, err := store.intern(mmdbtype.String("third"))
+	require.NoError(t, err)
+
+	// Locate second dynamically and require a non-head position, so the
+	// test keeps exercising a mid-chain unlink if the chain's insertion
+	// order ever changes.
+	head := store.buckets[7]
+	require.NotEqual(t, second, head, "second must sit mid-chain for this test")
+	position := head
+	for position != nilValueRef && position != second {
+		position = store.nodes[position].nextInBucket
+	}
+	require.Equal(t, second, position, "second is missing from its chain")
+
+	store.release(second)
+
+	firstAgain, err := store.intern(mmdbtype.String("first"))
+	require.NoError(t, err)
+	assert.Equal(t, first, firstAgain)
+	thirdAgain, err := store.intern(mmdbtype.String("third"))
+	require.NoError(t, err)
+	assert.Equal(t, third, thirdAgain)
+
+	store.release(first)
+	store.release(firstAgain)
+	store.release(third)
+	store.release(thirdAgain)
+}
+
+// TestValueStorePreservesFloatEncodings pins the wire-exact identity of the
+// store: values that differ only in a float sign bit are distinct.
+func TestValueStorePreservesFloatEncodings(t *testing.T) {
+	tests := []struct {
+		name     string
+		positive mmdbtype.DataType
+		negative mmdbtype.DataType
+	}{
+		{
+			name:     "float64",
+			positive: mmdbtype.Float64(0),
+			negative: mmdbtype.Float64(math.Copysign(0, -1)),
+		},
+		{
+			name:     "float32",
+			positive: mmdbtype.Float32(0),
+			negative: mmdbtype.Float32(float32(math.Copysign(0, -1))),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := newValueStoreWithHash(func([]byte) uint64 { return 1 })
+
+			positiveRef, err := store.intern(mmdbtype.Map{"value": test.positive})
+			require.NoError(t, err)
+			negativeRef, err := store.intern(mmdbtype.Map{"value": test.negative})
+			require.NoError(t, err)
+
+			assert.NotEqual(t, positiveRef, negativeRef)
+			store.release(positiveRef)
+			store.release(negativeRef)
+		})
+	}
+}
+
+func TestSliceIdentityPointerDoesNotAllocate(t *testing.T) {
+	value := mmdbtype.Slice{mmdbtype.String("value")}
+	var pointer uintptr
+	allocations := testing.AllocsPerRun(1_000, func() {
+		pointer = sliceIdentityPointer(value)
+	})
+
+	assert.NotZero(t, pointer)
+	assert.Zero(t, allocations)
+}
+
+func TestEmptyContainerIdentitiesAreCanonical(t *testing.T) {
+	nilMapIdentity, ok := dataIdentity(mmdbtype.Map(nil))
+	require.True(t, ok)
+	emptyMapIdentity, ok := dataIdentity(mmdbtype.Map{})
+	require.True(t, ok)
+	assert.Equal(t, nilMapIdentity, emptyMapIdentity)
+
+	nilSliceIdentity, ok := dataIdentity(mmdbtype.Slice(nil))
+	require.True(t, ok)
+	emptySliceIdentity, ok := dataIdentity(make(mmdbtype.Slice, 0, 1))
+	require.True(t, ok)
+	assert.Equal(t, nilSliceIdentity, emptySliceIdentity)
+}
+
+// TestStoreCrashGuards pins that ownership mistakes crash loudly with the
+// offending ref named, rather than corrupting the free list or a count.
+func TestStoreCrashGuards(t *testing.T) {
+	t.Run("double release", func(t *testing.T) {
+		store := newValueStore()
+		ref, err := store.internUncached(mmdbtype.String("gone"))
+		require.NoError(t, err)
+		store.release(ref)
+		require.PanicsWithValue(t,
+			fmt.Sprintf("mmdbwriter: invalid value reference %d", ref),
+			func() { store.release(ref) })
+	})
+
+	t.Run("retain overflow", func(t *testing.T) {
+		store := newValueStore()
+		ref, err := store.internUncached(mmdbtype.String("pinned"))
+		require.NoError(t, err)
+		store.nodes[ref].refCount = math.MaxUint32
+		require.PanicsWithValue(t,
+			fmt.Sprintf(
+				"mmdbwriter: reference count overflow for ref %d (kind %d)",
+				ref, valueKindString,
+			),
+			func() { store.retain(ref) })
+	})
+
+	t.Run("release underflow", func(t *testing.T) {
+		store := newValueStore()
+		ref, err := store.internUncached(mmdbtype.String("empty"))
+		require.NoError(t, err)
+		store.nodes[ref].refCount = 0
+		require.PanicsWithValue(t,
+			fmt.Sprintf(
+				"mmdbwriter: reference count underflow for ref %d (kind %d)",
+				ref, valueKindString,
+			),
+			func() { store.release(ref) })
+	})
+
+	t.Run("invalid reference", func(t *testing.T) {
+		store := newValueStore()
+		require.PanicsWithValue(t,
+			"mmdbwriter: invalid value reference 42",
+			func() { store.node(valueRef(42)) })
+	})
+}
+
+// TestEmptyContainersInternToDistinctRefs pins that kind alone separates two
+// nodes with identical empty payload and empty children, even under a forced
+// hash collision.
+func TestEmptyContainersInternToDistinctRefs(t *testing.T) {
+	store := newValueStoreWithHash(func([]byte) uint64 { return 42 })
+	emptyMap, err := store.intern(mmdbtype.Map{})
+	require.NoError(t, err)
+	emptySlice, err := store.intern(mmdbtype.Slice{})
+	require.NoError(t, err)
+	emptyBytes, err := store.intern(mmdbtype.Bytes{})
+	require.NoError(t, err)
+
+	assert.NotEqual(t, emptyMap, emptySlice)
+	assert.NotEqual(t, emptyMap, emptyBytes)
+	assert.NotEqual(t, emptySlice, emptyBytes)
+	assert.Equal(t, mmdbtype.Map{}, store.materialize(emptyMap))
+	assert.Equal(t, mmdbtype.Slice{}, store.materialize(emptySlice))
+}
+
+// TestStoresHashWithDistinctSeeds pins that every store draws a fresh hash
+// seed, so precomputed collisions cannot degrade the bucket chains.
+func TestStoresHashWithDistinctSeeds(t *testing.T) {
+	first := newValueStore()
+	second := newValueStore()
+	refFirst, err := first.intern(mmdbtype.String("seeded"))
+	require.NoError(t, err)
+	refSecond, err := second.intern(mmdbtype.String("seeded"))
+	require.NoError(t, err)
+	assert.NotEqual(t,
+		first.nodes[refFirst].hash, second.nodes[refSecond].hash,
+		"two stores hashed the same value identically")
+}
+
+// TestArenaReuseLeavesLiveNeighborsIntact pins that reusing a freed extent
+// does not rewrite a live node's payload or child list, the silent failure
+// mode the refcount audit cannot see.
+func TestArenaReuseLeavesLiveNeighborsIntact(t *testing.T) {
+	t.Run("payload arena", func(t *testing.T) {
+		store := newValueStore()
+		released, err := store.intern(mmdbtype.String("aaaa"))
+		require.NoError(t, err)
+		survivor, err := store.intern(mmdbtype.String("bbbb"))
+		require.NoError(t, err)
+		store.release(released)
+
+		replacement, err := store.intern(mmdbtype.String("cccc"))
+		require.NoError(t, err)
+		assert.Equal(t, mmdbtype.String("bbbb"), store.materialize(survivor),
+			"the arena reuse rewrote a live payload")
+		assert.Equal(t, mmdbtype.String("cccc"), store.materialize(replacement))
+	})
+
+	t.Run("child arena", func(t *testing.T) {
+		store := newValueStore()
+		released, err := store.intern(mmdbtype.Slice{mmdbtype.String("a")})
+		require.NoError(t, err)
+		survivor, err := store.intern(mmdbtype.Slice{mmdbtype.String("b")})
+		require.NoError(t, err)
+		store.release(released)
+
+		replacement, err := store.intern(mmdbtype.Slice{mmdbtype.String("c")})
+		require.NoError(t, err)
+		assert.Equal(t, mmdbtype.Slice{mmdbtype.String("b")},
+			store.materialize(survivor),
+			"the arena reuse rewrote a live child list")
+		assert.Equal(t, mmdbtype.Slice{mmdbtype.String("c")},
+			store.materialize(replacement))
+	})
+}
+
+// TestReleasePanicsWhenNodeMissingFromItsBucket pins that release refuses to
+// recycle a slot its hash chain no longer reaches, instead of spreading the
+// corruption silently.
+func TestReleasePanicsWhenNodeMissingFromItsBucket(t *testing.T) {
+	store := newValueStore()
+	ref, err := store.internUncached(mmdbtype.String("orphan"))
+	require.NoError(t, err)
+	clear(store.buckets)
+
+	require.PanicsWithValue(t,
+		fmt.Sprintf("mmdbwriter: released ref %d is missing from its hash bucket", ref),
+		func() { store.release(ref) })
+}
+
+// TestReleaseResolvedPreservesReleasePanic pins that the explicit cleanup in
+// finishInsert cannot make its deferred cleanup mask the original store panic.
+func TestReleaseResolvedPreservesReleasePanic(t *testing.T) {
+	store := newValueStore()
+	ref, err := store.internUncached(mmdbtype.String("orphan"))
+	require.NoError(t, err)
+	iRec := &insertRecord{store: store, value: ref}
+	clear(store.buckets)
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		defer iRec.releaseResolved()
+		iRec.releaseResolved()
+	}()
+
+	assert.Equal(t,
+		fmt.Sprintf("mmdbwriter: released ref %d is missing from its hash bucket", ref),
+		recovered,
+	)
+}
+
+// TestPutPairScratchClearsEntries pins that pooled map scratch does not pin
+// caller-owned keys and values between uses.
+func TestPutPairScratchClearsEntries(t *testing.T) {
+	store := newValueStore()
+	ref, err := store.intern(mmdbtype.Map{"key": mmdbtype.String("value")})
+	require.NoError(t, err)
+	store.release(ref)
+
+	pairs := store.takePairScratch()
+	require.NotZero(t, cap(pairs), "internMap did not return its scratch to the pool")
+	for _, pair := range pairs[:cap(pairs)] {
+		assert.Zero(t, pair, "a pooled map entry still references caller data")
+	}
+}
+
+// TestMemoPinsItsKeys pins that the insert memo owns a reference to each key.
+// Without it, a released key ref could be recycled for a new value and
+// produce a false memo hit.
+func TestMemoPinsItsKeys(t *testing.T) {
+	store := newValueStore()
+	first, err := store.internUncached(mmdbtype.String("first"))
+	require.NoError(t, err)
+	firstResult, err := store.internUncached(mmdbtype.String("first result"))
+	require.NoError(t, err)
+
+	// Only a pure inserter is memoized, so the fixture carries one.
+	iRec := &insertRecord{
+		store:    store,
+		resolver: insertResolver{pure: inserter.Replace},
+	}
+	iRec.rememberResolved(first, firstResult)
+	assert.Equal(t, uint32(2), store.nodes[first].refCount,
+		"the memo did not pin its key")
+
+	// A second entry promotes the memo to its map form.
+	second, err := store.internUncached(mmdbtype.String("second"))
+	require.NoError(t, err)
+	iRec.rememberResolved(second, nilValueRef)
+	assert.Equal(t, uint32(2), store.nodes[second].refCount)
+
+	iRec.releaseResolved()
+	store.release(first)
+	store.release(second)
+	assert.Zero(t, liveValueNodeCount(store))
+}
+
+// liveValueNodeCount reports how many store nodes are live. Tests use it to
+// pin that releases fully drain the store.
+func liveValueNodeCount(store *valueStore) int {
+	live := 0
+	for index := range store.nodes {
+		if store.nodes[index].kind != valueKindInvalid {
+			live++
+		}
+	}
+	return live
+}
+
+func TestDataIdentityDistinguishesKindsAndRejectsScalars(t *testing.T) {
+	bytesIdentity, ok := dataIdentity(mmdbtype.Bytes{})
+	require.True(t, ok)
+	sliceIdentity, ok := dataIdentity(mmdbtype.Slice{})
+	require.True(t, ok)
+	assert.NotEqual(t, bytesIdentity, sliceIdentity)
+
+	for _, value := range []mmdbtype.DataType{mmdbtype.Uint128{}, &mmdbtype.Uint128{}, (*mmdbtype.Uint128)(nil)} {
+		_, ok = dataIdentity(value)
+		assert.False(t, ok)
+	}
+}
+
+func TestMapShapesSurviveChurnAndCollisions(t *testing.T) {
+	store := newValueStoreWithHash(func([]byte) uint64 { return 1 })
+	var refs []valueRef
+	external := map[valueRef]uint64{}
+	for index := range 100 {
+		value := mmdbtype.Map{
+			"a": mmdbtype.Uint32(index),
+			mmdbtype.String(string(rune('b' + index%8))): mmdbtype.Map{
+				"a": mmdbtype.String("nested"), "b": mmdbtype.Bool(true),
+			},
+		}
+		ref, err := store.intern(value)
+		require.NoError(t, err)
+		external[ref]++
+		refs = append(refs, ref)
+		require.True(t, value.Equal(store.materialize(ref)))
+		_, err = store.intern(mmdbtype.Map{"a": nil, "b": mmdbtype.String("invalid")})
+		require.Error(t, err)
+		if len(refs) > 4 {
+			old := refs[0]
+			refs = refs[1:]
+			external[old]--
+			if external[old] == 0 {
+				delete(external, old)
+			}
+			store.release(old)
+		}
+		require.NoError(t, store.audit(external))
+	}
+	for _, ref := range refs {
+		store.release(ref)
+	}
+	require.NoError(t, store.audit(nil))
+	for _, shape := range store.mapShapes {
+		require.Zero(t, shape.ref)
+	}
+}
+
+// TestMapShapeHitReleasesKeysOnError fails a map on its last key after
+// internMap reuses the cached key layout. The keys before it are borrowed from
+// the cached map, so the error path must release them and leave that map as
+// it was.
+func TestMapShapeHitReleasesKeysOnError(t *testing.T) {
+	tests := []struct {
+		name  string
+		value mmdbtype.DataType
+		err   string
+	}{
+		{
+			name:  "nil value",
+			value: nil,
+			err:   `map key "c" has a nil value`,
+		},
+		{
+			name:  "unsupported value",
+			value: mmdbtype.Pointer(1),
+			err:   `interning value for map key "c": unsupported MMDB data type mmdbtype.Pointer`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := newValueStore()
+			existing := mmdbtype.Map{
+				"a": mmdbtype.Uint32(1),
+				"b": mmdbtype.String("shared"),
+				"c": mmdbtype.Bool(true),
+			}
+			ref, err := store.intern(existing)
+			require.NoError(t, err)
+			require.Equal(t, mapShape{ref: ref}, store.mapShapes[3])
+
+			_, err = store.intern(mmdbtype.Map{
+				"a": mmdbtype.Uint32(2),
+				"b": mmdbtype.String("shared"),
+				"c": test.value,
+			})
+			require.EqualError(t, err, test.err)
+			require.NoError(t, store.audit(map[valueRef]uint64{ref: 1}))
+			require.True(t, existing.Equal(store.materialize(ref)))
+			require.Equal(t, mapShape{ref: ref}, store.mapShapes[3])
+
+			retry := mmdbtype.Map{
+				"a": mmdbtype.Uint32(2),
+				"b": mmdbtype.String("shared"),
+				"c": mmdbtype.Bool(false),
+			}
+			retryRef, err := store.intern(retry)
+			require.NoError(t, err)
+			require.True(t, retry.Equal(store.materialize(retryRef)))
+			require.True(t, existing.Equal(store.materialize(ref)))
+			require.Equal(t, mapShape{ref: retryRef}, store.mapShapes[3])
+			require.NoError(t, store.audit(map[valueRef]uint64{ref: 1, retryRef: 1}))
+
+			store.release(retryRef)
+			store.release(ref)
+			require.NoError(t, store.audit(nil))
+		})
+	}
+}
+
+// TestMapShapeHitSkipsKeyInterning counts hash calls to show that internMap
+// reuses cached key refs. A map that misses the cache hashes its keys, its
+// values and itself. A map that hits hashes only its values and itself.
+func TestMapShapeHitSkipsKeyInterning(t *testing.T) {
+	const (
+		miss = 7 // 3 keys, 3 values and the map
+		hit  = 4 // 3 values and the map
+	)
+	seed := maphash.MakeSeed()
+	hashes := 0
+	store := newValueStoreWithHash(func(b []byte) uint64 {
+		hashes++
+		return maphash.Bytes(seed, b)
+	})
+	next := uint32(0)
+	external := map[valueRef]uint64{}
+	internCounting := func(keys ...mmdbtype.String) int {
+		t.Helper()
+		value := mmdbtype.Map{}
+		for _, key := range keys {
+			next++
+			value[key] = mmdbtype.Uint32(next)
+		}
+		hashes = 0
+		ref, err := store.intern(value)
+		require.NoError(t, err)
+		count := hashes
+		external[ref]++
+		require.True(t, value.Equal(store.materialize(ref)))
+		return count
+	}
+	continent := []mmdbtype.String{"code", "geoname_id", "names"}
+	country := []mmdbtype.String{"geoname_id", "iso_code", "names"}
+
+	require.Equal(t, miss, internCounting(continent...))
+	require.Equal(t, hit, internCounting(continent...))
+	// A different layout misses and turns the cache off for the next
+	// mapShapeSkipAfterMiss maps.
+	require.Equal(t, miss, internCounting(country...))
+	for range mapShapeSkipAfterMiss {
+		require.Equal(t, miss, internCounting(country...))
+	}
+	require.Equal(t, hit, internCounting(country...))
+
+	require.NoError(t, store.audit(external))
+	for ref, count := range external {
+		for range count {
+			store.release(ref)
+		}
+	}
+	require.NoError(t, store.audit(nil))
+}

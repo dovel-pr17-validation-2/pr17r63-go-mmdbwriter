@@ -1,0 +1,213 @@
+package mmdbwriter
+
+import (
+	"bytes"
+	"fmt"
+	"math"
+
+	"github.com/maxmind/mmdbwriter/v2/internal/ctrlsize"
+	"github.com/maxmind/mmdbwriter/v2/mmdbtype"
+)
+
+// Keep size first so offset entries occupy 16 bytes on 64-bit platforms.
+type writtenType struct {
+	size    int64
+	pointer mmdbtype.Pointer
+	written bool
+}
+
+type dataWriter struct {
+	*bytes.Buffer
+
+	store *valueStore
+	// offsets is indexed by valueRef. Refs are dense, so a slice replaces the
+	// hashing and exact comparison the previous writer needed for every value.
+	offsets     []writtenType
+	usePointers bool
+}
+
+func newDataWriter(store *valueStore, usePointers bool) *dataWriter {
+	return &dataWriter{
+		Buffer:      &bytes.Buffer{},
+		store:       store,
+		offsets:     make([]writtenType, len(store.nodes)),
+		usePointers: usePointers,
+	}
+}
+
+// ensureOffset grows the offset table for refs interned after the writer was
+// created, such as metadata values.
+func (dw *dataWriter) ensureOffset(ref valueRef) {
+	if int(ref) < len(dw.offsets) {
+		return
+	}
+	dw.offsets = append(dw.offsets, make([]writtenType, int(ref)-len(dw.offsets)+1)...)
+}
+
+// offset returns the offset of a value that maybeWrite wrote.
+func (dw *dataWriter) offset(ref valueRef) (int, bool) {
+	if int(ref) >= len(dw.offsets) || !dw.offsets[ref].written {
+		return 0, false
+	}
+	return int(dw.offsets[ref].pointer), true
+}
+
+func (dw *dataWriter) maybeWrite(ref valueRef) (int, error) {
+	dw.ensureOffset(ref)
+	if written := dw.offsets[ref]; written.written {
+		return int(written.pointer), nil
+	}
+
+	offset := dw.Len()
+	size, err := dw.writeValue(ref)
+	if err != nil {
+		return 0, err
+	}
+	if int64(offset) > int64(math.MaxUint32) {
+		return 0, fmt.Errorf("offset of %d exceeds maximum when writing data", offset)
+	}
+	dw.offsets[ref] = writtenType{
+		pointer: mmdbtype.Pointer(offset), //nolint:gosec // checked above
+		size:    size,
+		written: true,
+	}
+	return offset, nil
+}
+
+// writeValue writes a canonical value. Callers register the offset of a first
+// occurrence themselves, after the full value is emitted, which matches the
+// historical greedy pointer algorithm.
+func (dw *dataWriter) writeValue(ref valueRef) (int64, error) {
+	node := dw.store.node(ref)
+	start := dw.Len()
+	if !isContainer(node) {
+		written, err := dw.Write(dw.store.payload(node))
+		return int64(written), err
+	}
+
+	if err := writeContainerHeader(dw, node.kind, containerEntries(node)); err != nil {
+		return int64(dw.Len() - start), err
+	}
+	for _, child := range dw.store.childRefs(node) {
+		if _, err := dw.writeOrWritePointer(child); err != nil {
+			return int64(dw.Len() - start), err
+		}
+	}
+	return int64(dw.Len() - start), nil
+}
+
+func (dw *dataWriter) rememberOffset(ref valueRef, offset int, size int64) error {
+	dw.ensureOffset(ref)
+	if dw.offsets[ref].written {
+		return nil
+	}
+	if int64(offset) > int64(math.MaxUint32) {
+		return fmt.Errorf("offset of %d exceeds maximum when writing data", offset)
+	}
+	dw.offsets[ref] = writtenType{
+		pointer: mmdbtype.Pointer(offset), //nolint:gosec // checked above
+		size:    size,
+		written: true,
+	}
+	return nil
+}
+
+func (dw *dataWriter) writeOrWritePointer(ref valueRef) (int64, error) {
+	dw.ensureOffset(ref)
+	written := dw.offsets[ref]
+	// Only use a pointer if it would take less space than writing the value
+	// again.
+	if dw.usePointers && written.written && written.size > written.pointer.WrittenSize() {
+		return written.pointer.WriteTo(dw)
+	}
+	start := dw.Len()
+	size, err := dw.writeValue(ref)
+	if err != nil {
+		return size, err
+	}
+	if !written.written {
+		if err := dw.rememberOffset(ref, start, size); err != nil {
+			return size, err
+		}
+	}
+	return size, nil
+}
+
+// WriteOrWritePointer and WriteOrWritePointerString satisfy mmdbtype's writer
+// interface, which Pointer.WriteTo requires. They write the value in full and
+// never record an offset: an offset for a reference the caller later releases
+// could be recycled and then point at unrelated data.
+func (dw *dataWriter) WriteOrWritePointer(value mmdbtype.DataType) (int64, error) {
+	return value.WriteTo(dw)
+}
+
+func (dw *dataWriter) WriteOrWritePointerString(value mmdbtype.String) (int64, error) {
+	return value.WriteTo(dw)
+}
+
+func isContainer(node *valueNode) bool {
+	return node.kind == valueKindMap || node.kind == valueKindSlice
+}
+
+// containerEntries returns the number of entries in a map or slice. A map
+// stores each key and value as two children.
+func containerEntries(node *valueNode) int {
+	entries := int(node.childrenLen)
+	if node.kind == valueKindMap {
+		entries /= 2
+	}
+	return entries
+}
+
+// containerHeaderSize returns the number of bytes that writeContainerHeader
+// writes for a container with size entries. For a size that
+// writeContainerHeader rejects, it returns the size of the largest header.
+func containerHeaderSize(kind valueKind, size int) uint64 {
+	header := uint64(1)
+	if kind == valueKindSlice {
+		// A slice uses the extended type byte.
+		header++
+	}
+	_, _, sizeBytes := ctrlsize.Split(size)
+	return header + uint64(sizeBytes) //nolint:gosec // sizeBytes is 0 to 3.
+}
+
+func writeContainerHeader(
+	writer interface{ WriteByte(byte) error },
+	kind valueKind,
+	size int,
+) error {
+	typeNumber := byte(7) // map
+	if kind == valueKindSlice {
+		typeNumber = 11
+	}
+	extended := typeNumber >= 8
+	var first byte
+	var second byte
+	if extended {
+		second = typeNumber - 7
+	} else {
+		first = typeNumber << 5
+	}
+
+	if size > ctrlsize.Max {
+		return fmt.Errorf("cannot store %d container entries", size)
+	}
+	sizeBits, remaining, remainingSize := ctrlsize.Split(size)
+	first |= sizeBits
+	if err := writer.WriteByte(first); err != nil {
+		return fmt.Errorf("writing container control byte: %w", err)
+	}
+	if extended {
+		if err := writer.WriteByte(second); err != nil {
+			return fmt.Errorf("writing extended container type: %w", err)
+		}
+	}
+	for index := remainingSize - 1; index >= 0; index-- {
+		value := byte(remaining >> (8 * index)) //nolint:gosec // one encoded size byte
+		if err := writer.WriteByte(value); err != nil {
+			return fmt.Errorf("writing container size: %w", err)
+		}
+	}
+	return nil
+}

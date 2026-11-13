@@ -1,0 +1,733 @@
+package mmdbwriter
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/maxmind/mmdbwriter/v2/inserter"
+	"github.com/maxmind/mmdbwriter/v2/internal/treeaddr"
+	"github.com/maxmind/mmdbwriter/v2/mmdbtype"
+)
+
+type recordType byte
+
+const (
+	recordTypeEmpty recordType = iota
+	recordTypeData
+	recordTypeNode
+	recordTypeAlias
+	recordTypeFixedNode
+	recordTypeReserved
+	recordTypePath
+	recordTypeRetired
+)
+
+type record struct {
+	value valueRef
+	// nodeIndex indexes Tree node blocks for node-like records and Tree.paths
+	// for compressed-path records.
+	nodeIndex nodeIndex
+
+	recordType recordType
+}
+
+// isOwningNode reports whether the record directly owns a tree node.
+func (r *record) isOwningNode() bool {
+	return r.recordType == recordTypeNode || r.recordType == recordTypeFixedNode
+}
+
+// each node contains two records.
+type node struct {
+	children [2]record
+}
+
+type compressedPath struct {
+	ip       [16]byte
+	record   record
+	endDepth int
+}
+
+type nodeIndex uint32
+
+const (
+	rootNodeIndex nodeIndex = 0
+	noNodeIndex             = ^nodeIndex(0)
+	nodeBlockSize           = 1024
+)
+
+// insertRecord carries the state for one insert call. Most fields are fixed for
+// the life of the value. These are not:
+//
+//   - ip, prefixLen, and insertedAs4, which insertPrepared re-targets for every
+//     subnet of a range, on every insert path.
+//   - splitDepth, which insertPrepared resets for each subnet and traversal
+//     sets when it splits a record.
+//   - the memo fields, which resolve updates as it goes.
+//
+// The memo is only used for pure inserters. It is keyed on the existing value
+// alone, which is sound only because the resolver and value are fixed: reusing an
+// insertRecord across inserts with a different value would return results
+// computed from the previous one.
+//
+// The memo owns one store reference per key and per non-nil result. Every
+// caller must run releaseResolved once insertion finishes. It releases the
+// memo references and the reference interned for the inserted value itself.
+// memoFirst and memoResult hold the single entry until a second distinct key
+// promotes both into memo, which clears them.
+//
+// Fields are ordered widest first. The struct is one allocation per insert
+// call, and this layout keeps it inside the 128-byte size class.
+type insertRecord struct {
+	resolver insertResolver
+
+	store *valueStore
+	tree  *Tree
+
+	// valueView is the value handed to the inserter as its new-value argument:
+	// the caller's value as passed for the insert entry points, or a
+	// store-materialized view when the insert began from an interned
+	// reference, as when loading.
+	valueView mmdbtype.DataType
+	memo      map[valueRef]valueRef
+
+	prefixLen int
+	ip        [16]byte
+
+	insertedNode nodeIndex
+	value        valueRef
+	memoFirst    valueRef
+	memoResult   valueRef
+
+	recordType recordType
+	// insertedAs4 records the address family that the tree-space ip cannot
+	// encode. A netip.Prefix field would carry it directly, but at 32 bytes
+	// it pushes the struct into the next size class, while a pointer to a
+	// prepared Metadata escapes to the heap once per insertRange call. The
+	// flag fits in padding, and rebuilding the prefix per record measures at
+	// about 4ns.
+	//
+	// Metadata and insertion errors use this flag. Every insertion path
+	// maintains it, so it cannot hold a value from an earlier insert.
+	insertedAs4 bool
+	// splitDepth is the depth of the record a split chain started from, which
+	// is the extent that record had before this insertion. Tree depths are at
+	// most 128, and zero is the sentinel for no active split.
+	//
+	// One field is enough for the whole walk, because a split chain and a
+	// descent deeper than prefixLen are never live at the same time. Splitting
+	// happens only at a record shallower than prefixLen, and the chain then
+	// descends through a single child until it resolves at exactly prefixLen.
+	// Records deeper than prefixLen resolve at their own depth and are never
+	// split. Threading the depth through every recursive call would buy
+	// nothing.
+	splitDepth uint8
+	memoSet    bool
+}
+
+// resolveValue returns the reference for a record and whether the caller owns
+// it. With no inserter the reference interned when the insert began is reused
+// directly: the store canonicalizes by content, so an equal existing value is
+// the same reference and replaceDataRecord makes the assignment a no-op.
+func (iRec *insertRecord) resolveValue(
+	existing valueRef,
+	existingDepth int,
+) (valueRef, bool, error) {
+	if !iRec.resolver.hasFunc() {
+		return iRec.value, false, nil
+	}
+	return iRec.resolve(existing, existingDepth)
+}
+
+// resolve returns a reference and whether the caller owns it. A pure
+// inserter's memo owns one reference to each non-nil result until insertion
+// finishes. A metadata-aware Func is not memoized, so a newly interned
+// reference is transferred directly to the target record.
+func (iRec *insertRecord) resolve(
+	existing valueRef,
+	existingDepth int,
+) (valueRef, bool, error) {
+	if iRec.resolver.pure != nil {
+		if iRec.memo != nil {
+			if value, ok := iRec.memo[existing]; ok {
+				return value, false, nil
+			}
+		} else if iRec.memoSet && iRec.memoFirst == existing {
+			return iRec.memoResult, false, nil
+		}
+	}
+	var result mmdbtype.DataType
+	var err error
+	if iRec.resolver.pure != nil {
+		result, err = iRec.resolver.pure(
+			iRec.store.materialize(existing),
+			iRec.valueView,
+		)
+	} else {
+		insertedNetwork, metadataErr := treeaddr.PrefixFromInsertIP(
+			iRec.ip,
+			iRec.prefixLen,
+			iRec.tree.treeDepth,
+			iRec.insertedAs4,
+		)
+		if metadataErr != nil {
+			return nilValueRef, false, fmt.Errorf(
+				"creating inserted network metadata: %w",
+				metadataErr,
+			)
+		}
+		metadata := inserter.Metadata{
+			InsertedNetwork: insertedNetwork,
+			ExistingDepth:   existingDepth,
+			TreeDepth:       iRec.tree.treeDepth,
+		}
+		if existingDepth == iRec.prefixLen {
+			// ip is masked at prefixLen and the walk has not descended past
+			// it, so no masking is needed.
+			metadata.ExistingAddr = iRec.ip
+		} else {
+			// Shallower records sit in a split chain, which leaves ip's deeper
+			// bits zero. Deeper records carry the descent path insertNode
+			// wrote, and masking drops the bits past this record.
+			metadata.ExistingAddr = maskedTreeAddr(iRec.ip, existingDepth)
+		}
+		result, err = iRec.resolver.withMetadata(
+			iRec.store.materialize(existing),
+			iRec.valueView,
+			metadata,
+		)
+	}
+	if err != nil {
+		return nilValueRef, false, err
+	}
+	if result == nil {
+		if iRec.resolver.pure != nil {
+			iRec.rememberResolved(existing, nilValueRef)
+		}
+		return nilValueRef, false, nil
+	}
+
+	// A result equal to the existing value interns to the existing reference,
+	// as intern canonicalizes by content, and the assignment in
+	// replaceDataRecord then becomes a no-op. Interning is wire-exact, so
+	// values that differ only in a float sign bit or NaN payload get a new
+	// reference and replace the old one.
+	value, err := iRec.store.intern(result)
+	if err != nil {
+		return nilValueRef, false, err
+	}
+	if iRec.resolver.pure != nil {
+		iRec.rememberResolved(existing, value)
+		return value, false, nil
+	}
+	return value, true, nil
+}
+
+func (iRec *insertRecord) rememberResolved(existing, result valueRef) {
+	// The memo owns a reference to each key. Without it, a released key ref
+	// could be recycled for a new value and produce a false memo hit.
+	iRec.store.retain(existing)
+	// Keep the common one-result case allocation-free. A second distinct
+	// existing value promotes the first entry into the map.
+	if iRec.memo == nil && !iRec.memoSet {
+		iRec.memoFirst = existing
+		iRec.memoResult = result
+		iRec.memoSet = true
+		return
+	}
+	if iRec.memo == nil {
+		iRec.memo = map[valueRef]valueRef{
+			iRec.memoFirst: iRec.memoResult,
+		}
+		// Clear the single-entry fields at promotion, so a reader that
+		// forgets to check the map first reads nil instead of a stale hit.
+		iRec.memoFirst = nilValueRef
+		iRec.memoResult = nilValueRef
+		iRec.memoSet = false
+	}
+	iRec.memo[existing] = result
+}
+
+// releaseResolved releases every reference the insertRecord owns: the value
+// interned when the insert began, the memoized inserter results, and the memo
+// keys. It detaches every field before releasing anything, so a release panic
+// cannot make the deferred second call retry the same reference and mask the
+// original failure. A second call is otherwise a no-op. That lets callers both
+// defer it for panic safety and call it explicitly before the audit runs.
+func (iRec *insertRecord) releaseResolved() {
+	value := iRec.value
+	memo := iRec.memo
+	memoFirst := iRec.memoFirst
+	memoResult := iRec.memoResult
+	memoSet := iRec.memoSet
+
+	iRec.value = nilValueRef
+	iRec.memo = nil
+	iRec.memoFirst = nilValueRef
+	iRec.memoResult = nilValueRef
+	iRec.memoSet = false
+
+	iRec.store.release(value)
+	if memo != nil {
+		for key, value := range memo {
+			iRec.store.release(key)
+			iRec.store.release(value)
+		}
+	} else if memoSet {
+		iRec.store.release(memoFirst)
+		iRec.store.release(memoResult)
+	}
+}
+
+// replaceDataRecord is the guarded mutation path for a record's value: it
+// releases the old value exactly once and stores the new one. The owned flag
+// is resolve's ownership handoff. When the caller already owns the incoming
+// reference, the record adopts it; otherwise the record retains its own. A
+// value equal to the old one leaves the record untouched, releasing the
+// incoming reference if it was owned.
+func (iRec *insertRecord) replaceDataRecord(
+	r *record,
+	value valueRef,
+	owned bool,
+) {
+	oldValue := r.value
+	r.nodeIndex = iRec.insertedNode
+	if value == nilValueRef {
+		r.recordType = recordTypeEmpty
+		r.value = nilValueRef
+		iRec.store.release(oldValue)
+		return
+	}
+
+	r.recordType = recordTypeData
+	if oldValue != value {
+		if !owned {
+			iRec.store.retain(value)
+		}
+		r.value = value
+		iRec.store.release(oldValue)
+		return
+	}
+	if owned {
+		iRec.store.release(value)
+	}
+}
+
+func newNodeIndex(index int) nodeIndex {
+	if index < 0 {
+		panic("node index is negative")
+	}
+	if uint64(index) >= uint64(noNodeIndex) {
+		panic("node index exceeds usable range")
+	}
+	return nodeIndex(index)
+}
+
+func (t *Tree) newNode(children [2]record) nodeIndex {
+	var index nodeIndex
+	if n := len(t.freeNodes); n != 0 {
+		index = t.freeNodes[n-1]
+		if t.poisonTreeSlots {
+			// Reuse would make stale indexes valid and erase evidence of this bug.
+			panic("mmdbwriter: cannot reuse node slot in poison mode")
+		}
+		if t.rawNodeAt(index).children[0].recordType != recordTypeRetired {
+			// A live slot on the free list indicates an internal ownership bug.
+			panic("mmdbwriter: recycled node slot is not retired")
+		}
+		t.freeNodes = t.freeNodes[:n-1]
+	} else {
+		index = newNodeIndex(t.nodeCountAllocated)
+		if t.nodeCountAllocated == len(t.nodeBlocks)*nodeBlockSize {
+			t.nodeBlocks = append(t.nodeBlocks, make([]node, nodeBlockSize))
+		}
+		t.nodeCountAllocated++
+	}
+	*t.rawNodeAt(index) = node{children: children}
+	return index
+}
+
+// rawNodeAt bypasses retirement checks for slot initialization and auditing.
+func (t *Tree) rawNodeAt(index nodeIndex) *node {
+	return &t.nodeBlocks[int(index)/nodeBlockSize][int(index)%nodeBlockSize]
+}
+
+func (t *Tree) nodeAt(index nodeIndex) *node {
+	n := t.rawNodeAt(index)
+	if n.children[0].recordType == recordTypeRetired {
+		// A retired index indicates an internal use-after-free bug, not invalid
+		// caller input. The caller cannot safely continue using the tree.
+		panic(retiredIndexError{kind: "node", index: index})
+	}
+	return n
+}
+
+// Defer formatting until a panic is printed so slot accessors can be inlined.
+type retiredIndexError struct {
+	kind  string
+	index nodeIndex
+}
+
+func (e retiredIndexError) Error() string {
+	return fmt.Sprintf("mmdbwriter: retired %s index %d", e.kind, e.index)
+}
+
+// retireNode transfers no ownership. The caller must first move or release
+// both child records and remove the owning edge.
+func (t *Tree) retireNode(index nodeIndex) {
+	if index == t.root {
+		// The root must remain live for the tree's lifetime. Retiring it
+		// indicates an internal ownership bug.
+		panic("mmdbwriter: cannot retire the root node")
+	}
+	n := t.nodeAt(index)
+	// Invalidate paths saved between inserts before this slot can be reused.
+	// An active cursor walk repairs its path before marking it valid again.
+	t.insertCursor.valid = false
+	*n = node{children: [2]record{{recordType: recordTypeRetired}, {}}}
+	if !t.poisonTreeSlots {
+		t.freeNodes = append(t.freeNodes, index)
+	}
+}
+
+func (t *Tree) pathAt(index nodeIndex) compressedPath {
+	path := t.paths[index]
+	if path.record.recordType == recordTypeRetired {
+		// As in nodeAt, accessing a retired slot indicates an internal
+		// use-after-free bug that the caller cannot recover from.
+		panic(retiredIndexError{kind: "path", index: index})
+	}
+	return path
+}
+
+// The caller must transfer the path's record and replace its owning edge
+// before calling retirePath.
+func (t *Tree) retirePath(index nodeIndex) {
+	_ = t.pathAt(index)
+	t.paths[index] = compressedPath{record: record{recordType: recordTypeRetired}}
+	if !t.poisonTreeSlots {
+		t.freePaths = append(t.freePaths, index)
+	}
+}
+
+// newPath avoids allocating one node per remaining bit until an insert
+// reaches the path or finalization expands it.
+func (t *Tree) newPath(ip [16]byte, endDepth int, r record) nodeIndex {
+	path := compressedPath{ip: ip, endDepth: endDepth, record: r}
+	if n := len(t.freePaths); n != 0 {
+		index := t.freePaths[n-1]
+		if t.poisonTreeSlots {
+			// Reuse would make stale indexes valid and erase evidence of this bug.
+			panic("mmdbwriter: cannot reuse path slot in poison mode")
+		}
+		if t.paths[index].record.recordType != recordTypeRetired {
+			// A live slot on the free list indicates an internal ownership bug.
+			panic("mmdbwriter: recycled path slot is not retired")
+		}
+		t.freePaths = t.freePaths[:n-1]
+		t.paths[index] = path
+		return index
+	}
+	index := newNodeIndex(len(t.paths))
+	t.paths = append(t.paths, path)
+	return index
+}
+
+// materializePath expands a compressed path into ordinary nodes starting at
+// startDepth. The caller replaces the path record with the returned record.
+func (t *Tree) materializePath(startDepth int, path compressedPath) record {
+	child := path.record
+	for depth := path.endDepth - 1; depth >= startDepth; depth-- {
+		var children [2]record
+		children[bitAt(path.ip, depth)] = child
+		child = record{
+			nodeIndex:  t.newNode(children),
+			recordType: recordTypeNode,
+		}
+	}
+	return child
+}
+
+func (iRec *insertRecord) insertNode(
+	index nodeIndex,
+	currentDepth int,
+) error {
+	newDepth := currentDepth + 1
+	node := iRec.tree.nodeAt(index)
+	// Check if we are inside the network already
+	if newDepth > iRec.prefixLen {
+		// Data already exists for the network so insert into all the children.
+		// Identical child records are merged as recursion unwinds.
+		//
+		// Record which child we take in iRec.ip. Navigation no longer reads
+		// these bits once the walk is deeper than prefixLen, so they can carry
+		// the descent path that metadata needs to report a record more
+		// specific than the insert. Both branches write the bit, because a
+		// sibling subtree may have left it set. Nothing restores it:
+		// maskedTreeAddr drops every bit past the record's own depth,
+		// PrefixFromInsertIP masks at prefixLen, and insertPrepared overwrites
+		// ip for the next subnet of a range.
+		setBitAt(&iRec.ip, currentDepth, 0)
+		err := iRec.insertRecord(&node.children[0], newDepth)
+		if err != nil {
+			return err
+		}
+		setBitAt(&iRec.ip, currentDepth, 1)
+		return iRec.insertRecord(&node.children[1], newDepth)
+	}
+
+	// We haven't reached the network yet.
+	pos := bitAt(iRec.ip, currentDepth)
+	return iRec.insertRecord(&node.children[pos], newDepth)
+}
+
+func (iRec *insertRecord) insertRecord(
+	r *record,
+	newDepth int,
+) error {
+	switch r.recordType {
+	case recordTypeNode, recordTypeFixedNode:
+		return iRec.mergeChildrenAfterInsert(r, iRec.insertNode(r.nodeIndex, newDepth))
+	case recordTypePath:
+		index := r.nodeIndex
+		path := iRec.tree.pathAt(index)
+		*r = iRec.tree.materializePath(newDepth, path)
+		iRec.tree.retirePath(index)
+		return iRec.insertRecord(r, newDepth)
+	case recordTypeEmpty, recordTypeData:
+		if newDepth >= iRec.prefixLen {
+			if iRec.recordType == recordTypeData {
+				existingDepth := newDepth
+				if iRec.splitDepth != 0 {
+					existingDepth = int(iRec.splitDepth)
+				}
+				value, owned, err := iRec.resolveValue(r.value, existingDepth)
+				if err != nil {
+					return err
+				}
+				iRec.replaceDataRecord(r, value, owned)
+			} else {
+				// This mirrors replaceDataRecord's release-then-overwrite for
+				// a non-data target. It stays inline because the split case
+				// below transfers the old reference instead of releasing it,
+				// so a shared helper would cover only part of the pattern.
+				oldValue := r.value
+				r.nodeIndex = iRec.insertedNode
+				r.recordType = iRec.recordType
+				r.value = nilValueRef
+				iRec.store.release(oldValue)
+			}
+			return nil
+		}
+
+		if r.recordType == recordTypeEmpty && iRec.recordType == recordTypeData {
+			// newDepth is the record's own extent, with no splitDepth check.
+			// Only a data record splits, so a split chain never descends into
+			// an empty record and splitDepth is necessarily zero here.
+			value, owned, err := iRec.resolveValue(nilValueRef, newDepth)
+			if err != nil {
+				return err
+			}
+			if value == nilValueRef {
+				return nil
+			}
+			if !owned {
+				iRec.store.retain(value)
+			}
+			r.nodeIndex = iRec.tree.newPath(iRec.ip, iRec.prefixLen, record{
+				value:      value,
+				recordType: recordTypeData,
+			})
+			r.recordType = recordTypePath
+			return nil
+		}
+
+		// We are splitting this record so we create two duplicate child
+		// records.
+		if iRec.splitDepth == 0 {
+			iRec.splitDepth = uint8(newDepth) //nolint:gosec // Tree depths cannot exceed 128.
+		}
+		if r.recordType == recordTypeData {
+			iRec.store.retain(r.value)
+		}
+		r.nodeIndex = iRec.tree.newNode([2]record{*r, *r})
+		r.value = nilValueRef
+		r.recordType = recordTypeNode
+		return iRec.mergeChildrenAfterInsert(r, iRec.insertNode(r.nodeIndex, newDepth))
+	case recordTypeReserved:
+		if iRec.prefixLen >= newDepth {
+			return newReservedNetworkError(
+				iRec.ip,
+				newDepth,
+				iRec.prefixLen,
+				iRec.tree.treeDepth,
+				iRec.insertedAs4,
+			)
+		}
+		// We are inserting a network that contains a reserved network. Leave
+		// the reserved record as it is, and do not report it to an inserter.
+		return nil
+	case recordTypeAlias:
+		if iRec.prefixLen < newDepth {
+			// Do nothing. We are inserting a network that contains an aliased
+			// network. We silently ignore.
+			return nil
+		}
+		// attempting to insert _into_ an aliased network
+		return newAliasedNetworkError(
+			iRec.ip,
+			newDepth,
+			iRec.prefixLen,
+			iRec.tree.treeDepth,
+			iRec.insertedAs4,
+		)
+	default:
+		return fmt.Errorf("inserting into record type %d is not implemented", r.recordType)
+	}
+}
+
+// mergeChildrenAfterInsert restores record boundaries as either traversal
+// unwinds, including after a partial failure. Fixed nodes keep their identity
+// because aliases may refer to them.
+func (iRec *insertRecord) mergeChildrenAfterInsert(r *record, insertErr error) error {
+	if r.recordType == recordTypeFixedNode {
+		return insertErr
+	}
+	mergeErr := iRec.maybeMergeChildren(r)
+	if insertErr == nil {
+		return mergeErr
+	}
+	if mergeErr == nil {
+		return insertErr
+	}
+	// Name the source, so a log reader can tell a failure to restore the record
+	// boundaries from the insert failure that triggered the restore.
+	return errors.Join(insertErr, fmt.Errorf(
+		"restoring record boundaries after insert failure: %w",
+		mergeErr,
+	))
+}
+
+func (iRec *insertRecord) maybeMergeChildren(r *record) error {
+	// Check to see if the children are the same and can be merged.
+	// Use pointer access to avoid copying the record struct; this is
+	// called from every node-level insert, so the copies add up across
+	// millions of inserts.
+	index := r.nodeIndex
+	node := iRec.tree.nodeAt(index)
+	child0 := &node.children[0]
+	child1 := &node.children[1]
+	if child0.recordType != child1.recordType {
+		return nil
+	}
+	switch child0.recordType {
+	// Node-like and compressed-path records can't be merged by record equality.
+	case recordTypeFixedNode, recordTypeNode, recordTypePath:
+		return nil
+	case recordTypeEmpty, recordTypeReserved:
+		r.recordType = child0.recordType
+		r.nodeIndex = noNodeIndex
+		iRec.tree.retireNode(index)
+		return nil
+	case recordTypeData:
+		// The store keeps exactly one live node per wire-equal value, so
+		// reference equality here is value equality.
+		if child0.value != child1.value {
+			return nil
+		}
+		// Children have same data and can be merged
+		r.recordType = recordTypeData
+		r.value = child0.value
+		iRec.store.release(child1.value)
+		r.nodeIndex = noNodeIndex
+		iRec.tree.retireNode(index)
+		return nil
+	default:
+		return fmt.Errorf("merging record type %d is not implemented", child0.recordType)
+	}
+}
+
+func (t *Tree) getNode(
+	index nodeIndex,
+	ip [16]byte,
+	depth int,
+) (int, record) {
+	n := t.nodeAt(index)
+	r := n.children[bitAt(ip, depth)]
+
+	depth++
+
+	return t.getRecord(r, ip, depth)
+}
+
+func (t *Tree) getRecord(
+	r record,
+	ip [16]byte,
+	depth int,
+) (int, record) {
+	if r.recordType == recordTypePath {
+		path := t.pathAt(r.nodeIndex)
+		for pathDepth := depth; pathDepth < path.endDepth; pathDepth++ {
+			if bitAt(ip, pathDepth) != bitAt(path.ip, pathDepth) {
+				return pathDepth + 1, record{}
+			}
+		}
+		return t.getRecord(path.record, ip, path.endDepth)
+	}
+
+	switch r.recordType {
+	case recordTypeNode, recordTypeAlias, recordTypeFixedNode:
+		return t.getNode(r.nodeIndex, ip, depth)
+	case recordTypeRetired:
+		// A reachable retired record indicates an internal ownership bug.
+		// Panic instead of reporting missing data from a corrupt tree.
+		panic("mmdbwriter: retired record during lookup")
+	default:
+		return depth, r
+	}
+}
+
+func (t *Tree) expandPaths(index nodeIndex, currentDepth int) {
+	n := t.nodeAt(index)
+	for i := range 2 {
+		child := &n.children[i]
+		recordDepth := currentDepth + 1
+		switch child.recordType {
+		case recordTypePath:
+			pathIndex := child.nodeIndex
+			path := t.pathAt(pathIndex)
+			*child = t.materializePath(recordDepth, path)
+			t.retirePath(pathIndex)
+			if child.recordType == recordTypeNode {
+				t.expandPaths(child.nodeIndex, recordDepth)
+			}
+		case recordTypeNode, recordTypeFixedNode:
+			t.expandPaths(child.nodeIndex, recordDepth)
+		case recordTypeRetired:
+			// A reachable retired record indicates an internal ownership bug.
+			// Panic before the writer can serialize the corrupt tree.
+			panic("mmdbwriter: retired record during path expansion")
+		case recordTypeEmpty, recordTypeData, recordTypeAlias, recordTypeReserved:
+		}
+	}
+}
+
+func bitAt(ip [16]byte, depth int) byte {
+	return (ip[depth/8] >> (7 - (depth % 8))) & 1
+}
+
+// setBitAt sets the bit at depth in ip to bit, which must be 0 or 1.
+func setBitAt(ip *[16]byte, depth int, bit byte) {
+	shift := 7 - (depth % 8)
+	mask := byte(1) << shift
+	ip[depth/8] = ip[depth/8]&^mask | bit<<shift
+}
+
+func maskedTreeAddr(ip [16]byte, depth int) [16]byte {
+	byteIndex := depth / 8
+	if remainingBits := depth % 8; remainingBits != 0 {
+		ip[byteIndex] &= byte(0xff << (8 - remainingBits))
+		byteIndex++
+	}
+	clear(ip[byteIndex:])
+	return ip
+}

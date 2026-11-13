@@ -1,0 +1,446 @@
+package mmdbwriter
+
+import (
+	"fmt"
+)
+
+// RefcountAuditError reports that the audit found invalid tree structure or
+// value references. It signals a bug in this library or memory corruption, not
+// a problem with the caller's input, so retrying the failed call cannot help.
+type RefcountAuditError struct {
+	err error
+}
+
+func (e *RefcountAuditError) Error() string { return e.err.Error() }
+
+func (e *RefcountAuditError) Unwrap() error { return e.err }
+
+// maybeAuditValueStore runs the ownership audit when the tree was created
+// with Options.RefcountAudit or with MMDBWRITER_REFCOUNT_AUDIT set. Callers
+// invoke it after insert work reaches the store or after a successful load,
+// once every temporary reference has been released. A failure comes back as a
+// *RefcountAuditError, so callers can tell a broken tree from a rejected input.
+func (t *Tree) maybeAuditValueStore() error {
+	if !t.refcountAudit {
+		return nil
+	}
+	if err := t.auditValueStore(); err != nil {
+		return &RefcountAuditError{err: err}
+	}
+	return nil
+}
+
+// auditValueStore checks tree ownership, arena slots, the insertion cursor,
+// and references in the value DAG. It is intentionally expensive. Production
+// code reaches it through maybeAuditValueStore after inserts that reach the
+// store and successful loads. Tests call it directly.
+func (t *Tree) auditValueStore() error {
+	external := map[valueRef]uint64{}
+	seenNodes := map[nodeIndex]bool{}
+	seenPaths := map[nodeIndex]bool{}
+	var aliases []nodeIndex
+	var walkRecord func(record) error
+	var walkNode func(nodeIndex) error
+	walkRecord = func(record record) error {
+		if record.recordType != recordTypeData && record.value != nilValueRef {
+			return fmt.Errorf(
+				"refcount audit found a type %d record holding value ref %d",
+				record.recordType, record.value,
+			)
+		}
+		switch record.recordType {
+		case recordTypeData:
+			external[record.value]++
+		case recordTypeNode, recordTypeFixedNode:
+			return walkNode(record.nodeIndex)
+		case recordTypePath:
+			if uint64(record.nodeIndex) >= uint64(len(t.paths)) {
+				return fmt.Errorf("refcount audit found invalid path %d", record.nodeIndex)
+			}
+			if seenPaths[record.nodeIndex] {
+				return fmt.Errorf(
+					"refcount audit found path %d with multiple owning paths",
+					record.nodeIndex,
+				)
+			}
+			if t.paths[record.nodeIndex].record.recordType == recordTypeRetired {
+				return fmt.Errorf("refcount audit found retired path %d", record.nodeIndex)
+			}
+			seenPaths[record.nodeIndex] = true
+			return walkRecord(t.paths[record.nodeIndex].record)
+		case recordTypeAlias:
+			// Aliases do not own their targets. Check reachability after the
+			// owning walk finishes instead of following these edges.
+			aliases = append(aliases, record.nodeIndex)
+			return nil
+		case recordTypeEmpty, recordTypeReserved:
+			return nil
+		default:
+			return fmt.Errorf("refcount audit found record type %d", record.recordType)
+		}
+		return nil
+	}
+	walkNode = func(index nodeIndex) error {
+		if int64(index) >= int64(t.nodeCountAllocated) {
+			return fmt.Errorf("refcount audit found invalid node %d", index)
+		}
+		if seenNodes[index] {
+			return fmt.Errorf("refcount audit found node %d with multiple owning paths", index)
+		}
+		node := t.rawNodeAt(index)
+		if node.children[0].recordType == recordTypeRetired {
+			return fmt.Errorf("refcount audit found retired node %d", index)
+		}
+		seenNodes[index] = true
+		for _, child := range node.children {
+			if err := walkRecord(child); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walkNode(t.root); err != nil {
+		return err
+	}
+	for _, index := range aliases {
+		if !seenNodes[index] {
+			return fmt.Errorf("refcount audit found alias to unreachable node %d", index)
+		}
+	}
+	if err := auditTreeSlots(
+		"node",
+		t.nodeCountAllocated,
+		t.freeNodes,
+		seenNodes,
+		t.poisonTreeSlots,
+		func(index nodeIndex) bool { return t.rawNodeAt(index).children[0].recordType == recordTypeRetired },
+	); err != nil {
+		return err
+	}
+	if err := auditTreeSlots(
+		"path",
+		len(t.paths),
+		t.freePaths,
+		seenPaths,
+		t.poisonTreeSlots,
+		func(index nodeIndex) bool { return t.paths[index].record.recordType == recordTypeRetired },
+	); err != nil {
+		return err
+	}
+	if err := t.auditInsertCursor(); err != nil {
+		return err
+	}
+	return t.valueStore.audit(external)
+}
+
+// auditInsertCursor checks borrowed indexes against the owning path, not just
+// reachability: a retired slot reused elsewhere must not validate a stale cursor.
+// The caller has already checked that the owning tree itself is valid.
+func (t *Tree) auditInsertCursor() error {
+	c := &t.insertCursor
+	if !c.valid {
+		return nil
+	}
+	if c.length < 1 || c.length > t.treeDepth {
+		return fmt.Errorf(
+			"insertion cursor audit found invalid length %d (expected 1..%d)",
+			c.length,
+			t.treeDepth,
+		)
+	}
+	if c.nodes[0] != t.root {
+		return fmt.Errorf(
+			"insertion cursor audit found invalid root %d (expected %d)",
+			c.nodes[0],
+			t.root,
+		)
+	}
+	for depth := 1; depth < c.length; depth++ {
+		n := t.nodeAt(c.nodes[depth-1])
+		r := n.children[bitAt(c.last, depth-1)]
+		if !r.isOwningNode() || r.nodeIndex != c.nodes[depth] {
+			return fmt.Errorf("insertion cursor audit found stale path at depth %d", depth)
+		}
+	}
+	return nil
+}
+
+// auditTreeSlots accounts for every allocated slot, including retired slots
+// withheld from recycling by poison mode.
+func auditTreeSlots(
+	name string,
+	count int,
+	free []nodeIndex,
+	seen map[nodeIndex]bool,
+	poison bool,
+	retired func(nodeIndex) bool,
+) error {
+	if poison && len(free) != 0 {
+		return fmt.Errorf("refcount audit found queued free %s slots in poison mode", name)
+	}
+	queued := make(map[nodeIndex]bool, len(free))
+	for _, index := range free {
+		if int64(index) >= int64(count) || queued[index] || seen[index] || !retired(index) {
+			return fmt.Errorf("refcount audit found invalid free %s index %d", name, index)
+		}
+		queued[index] = true
+	}
+	for i := range count {
+		index := newNodeIndex(i)
+		if seen[index] {
+			continue
+		}
+		if !retired(index) || (!poison && !queued[index]) {
+			return fmt.Errorf("refcount audit found unclaimed %s index %d", name, index)
+		}
+	}
+	return nil
+}
+
+func (s *valueStore) audit(external map[valueRef]uint64) error {
+	expected := make([]uint64, len(s.nodes))
+	for ref, count := range external {
+		if ref == nilValueRef || uint64(ref) >= uint64(len(s.nodes)) {
+			return fmt.Errorf("refcount audit found invalid external ref %d", ref)
+		}
+		expected[ref] += count
+	}
+	if err := s.auditMaterializedIdentities(); err != nil {
+		return err
+	}
+	if err := s.auditMapShapes(); err != nil {
+		return err
+	}
+	if err := s.auditArenas(); err != nil {
+		return err
+	}
+	bucketCounts, err := s.auditBuckets()
+	if err != nil {
+		return err
+	}
+	freeCounts := make([]int, len(s.nodes))
+	for _, ref := range s.freeRefs {
+		if ref == nilValueRef || uint64(ref) >= uint64(len(s.nodes)) {
+			return fmt.Errorf("refcount audit found invalid free ref %d", ref)
+		}
+		freeCounts[ref]++
+	}
+	// Poisoned stores never queue freed slots, so every released slot must
+	// be absent from the freelist rather than listed once.
+	wantFree := 1
+	if s.poisonFreedRefs {
+		wantFree = 0
+	}
+	for index := 1; index < len(s.nodes); index++ {
+		node := &s.nodes[index]
+		if node.kind == valueKindInvalid {
+			if freeCounts[index] != wantFree {
+				return fmt.Errorf(
+					"refcount audit found free ref %d listed %d times",
+					index,
+					freeCounts[index],
+				)
+			}
+			continue
+		}
+		ref := valueRef(index)
+		if bucketCounts[index] != 1 {
+			return fmt.Errorf(
+				"refcount audit found live ref %d in %d hash buckets",
+				ref,
+				bucketCounts[index],
+			)
+		}
+		if freeCounts[index] != 0 {
+			return fmt.Errorf("refcount audit found live ref %d on the freelist", ref)
+		}
+		for _, child := range s.childRefs(node) {
+			if child == nilValueRef ||
+				uint64(child) >= uint64(len(s.nodes)) ||
+				s.nodes[child].kind == valueKindInvalid {
+				return fmt.Errorf("refcount audit found invalid child ref %d from %d", child, ref)
+			}
+			expected[child]++
+		}
+	}
+	for index := 1; index < len(s.nodes); index++ {
+		node := &s.nodes[index]
+		if node.kind == valueKindInvalid {
+			if expected[index] != 0 {
+				return fmt.Errorf(
+					"refcount audit expected %d references to free ref %d",
+					expected[index],
+					index,
+				)
+			}
+			continue
+		}
+		if uint64(node.refCount) != expected[index] {
+			return fmt.Errorf(
+				"refcount audit for ref %d: stored %d, expected %d",
+				index,
+				node.refCount,
+				expected[index],
+			)
+		}
+	}
+	return nil
+}
+
+func (s *valueStore) auditMapShapes() error {
+	for arity, shape := range &s.mapShapes {
+		ref := shape.ref
+		if ref == nilValueRef {
+			continue
+		}
+		if uint64(ref) >= uint64(len(s.nodes)) ||
+			s.nodes[ref].kind != valueKindMap || int(s.nodes[ref].childrenLen) != arity*2 {
+			return fmt.Errorf(
+				"refcount audit found invalid map shape ref %d for arity %d",
+				ref,
+				arity,
+			)
+		}
+	}
+	return nil
+}
+
+// auditBuckets walks every hash chain and counts how many chains reach each
+// node, validating chain membership and detecting cycles on the way.
+func (s *valueStore) auditBuckets() ([]int, error) {
+	bucketCounts := make([]int, len(s.nodes))
+	for hash, head := range s.buckets {
+		steps := 0
+		for ref := head; ref != nilValueRef; ref = s.nodes[ref].nextInBucket {
+			if uint64(ref) >= uint64(len(s.nodes)) {
+				return nil, fmt.Errorf("refcount audit found invalid bucket ref %d", ref)
+			}
+			if s.nodes[ref].kind == valueKindInvalid || s.nodes[ref].hash != hash {
+				return nil, fmt.Errorf(
+					"refcount audit found ref %d in the wrong hash bucket", ref,
+				)
+			}
+			bucketCounts[ref]++
+			steps++
+			if steps > len(s.nodes) {
+				return nil, fmt.Errorf(
+					"refcount audit found a bucket chain cycle for hash %d", hash,
+				)
+			}
+		}
+	}
+	return bucketCounts, nil
+}
+
+// arenaExtent is one claimed range in an arena, for the arena audit.
+type arenaExtent struct {
+	offset uint32
+	length uint32
+}
+
+// auditArenas verifies that the live payload and child extents are disjoint
+// and that every free-list extent is inside the arena, overlaps nothing, and
+// appears once. A violated extent invariant is the one ownership mistake
+// that corrupts records silently: two nodes sharing bytes stay readable and
+// keep their reference counts balanced.
+func (s *valueStore) auditArenas() error {
+	var payloads, children []arenaExtent
+	for index := 1; index < len(s.nodes); index++ {
+		node := &s.nodes[index]
+		if node.kind == valueKindInvalid {
+			continue
+		}
+		payloads = append(payloads,
+			arenaExtent{offset: node.payloadOffset, length: node.payloadLen})
+		children = append(children,
+			arenaExtent{offset: node.childrenOffset, length: node.childrenLen})
+	}
+	err := auditArenaExtents("payload", len(s.payloads.data), payloads, s.payloads.free)
+	if err != nil {
+		return err
+	}
+	return auditArenaExtents("child", len(s.children.data), children, s.children.free)
+}
+
+// auditArenaExtents marks each extent's range and reports the first byte
+// claimed twice or not at all. A live zero-length extent must use offset zero;
+// zero-length extents never belong on a freelist.
+func auditArenaExtents(
+	name string,
+	size int,
+	live []arenaExtent,
+	free map[uint32][]uint32,
+) error {
+	claimed := make([]bool, size)
+	mark := func(offset, length uint32) error {
+		if int64(offset)+int64(length) > int64(size) {
+			return fmt.Errorf(
+				"arena audit found a %s extent [%d, %d) past the arena end %d",
+				name, offset, int64(offset)+int64(length), size,
+			)
+		}
+		for index := offset; index < offset+length; index++ {
+			if claimed[index] {
+				return fmt.Errorf(
+					"arena audit found overlapping extents at %s arena offset %d",
+					name, index,
+				)
+			}
+			claimed[index] = true
+		}
+		return nil
+	}
+	for _, extent := range live {
+		if extent.length == 0 {
+			if extent.offset != 0 {
+				return fmt.Errorf(
+					"arena audit found a zero-length %s extent at offset %d",
+					name, extent.offset,
+				)
+			}
+			continue
+		}
+		if err := mark(extent.offset, extent.length); err != nil {
+			return err
+		}
+	}
+	for length, offsets := range free {
+		for _, offset := range offsets {
+			if length == 0 {
+				return fmt.Errorf(
+					"arena audit found a zero-length free %s extent at offset %d",
+					name, offset,
+				)
+			}
+			if err := mark(offset, length); err != nil {
+				return err
+			}
+		}
+	}
+	for index, isClaimed := range claimed {
+		if !isClaimed {
+			return fmt.Errorf(
+				"arena audit found unclaimed %s arena offset %d", name, index,
+			)
+		}
+	}
+	return nil
+}
+
+// auditMaterializedIdentities validates the materialized identity map. Its
+// entries are non-owning, so they add nothing to the expected counts. Each
+// mapped ref must be live and carry the identity that maps to it.
+func (s *valueStore) auditMaterializedIdentities() error {
+	for identity, ref := range s.materializedByIdentity {
+		if ref == nilValueRef || uint64(ref) >= uint64(len(s.nodes)) ||
+			s.nodes[ref].kind == valueKindInvalid {
+			return fmt.Errorf("identity audit found dead materialized ref %d", ref)
+		}
+		if !s.nodes[ref].hasIdentity || s.nodes[ref].identity != identity {
+			return fmt.Errorf(
+				"identity audit found ref %d under an identity it does not carry", ref,
+			)
+		}
+	}
+	return nil
+}
